@@ -1,0 +1,26 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; font-family: system-ui, "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; }
+body { display: flex; flex-direction: column; height: 100vh; }
+
+#header { background: #2d3a2e; color: #fff; padding: 10px 16px; }
+#header h1 { margin: 0 0 4px; font-size: 1.15rem; }
+#header p { margin: 0; font-size: 0.78rem; line-height: 1.5; color: #d8e0d8; }
+#header strong { color: #ffd27f; }
+
+#map { flex: 1 1 auto; }
+
+#footer { background: #f0f0ee; color: #555; padding: 6px 16px; font-size: 0.7rem; line-height: 1.4; }
+
+/* 凡例 */
+.legend { background: rgba(255,255,255,0.92); padding: 8px 10px; border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.3); font-size: 0.72rem; line-height: 1.5; color: #333; }
+.legend h4 { margin: 0 0 4px; font-size: 0.76rem; }
+.legend .bar { height: 10px; width: 140px; border-radius: 2px;
+  background: linear-gradient(to right, #2c7bb6, #abd9e9, #ffffbf, #fdae61, #d7191c); }
+.legend .scale { display: flex; justify-content: space-between; width: 140px; }
+.legend .row { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.legend .dot { width: 11px; height: 11px; border-radius: 50%; border: 1px solid #555; display: inline-block; }
+
+.popup-date { font-weight: bold; color: #b5460f; }
+.popup-place { font-size: 0.9rem; margin: 2px 0; }
+.popup-ev { display: inline-block; padding: 1px 6px; border-radius: 8px; color: #fff; font-size: 0.72rem; }

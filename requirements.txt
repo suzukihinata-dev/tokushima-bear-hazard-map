@@ -1,0 +1,7 @@
+numpy>=2.0
+pandas>=2.0
+scipy>=1.13
+requests>=2.31
+shapely>=2.0
+geopandas>=1.0
+jismesh>=2.1

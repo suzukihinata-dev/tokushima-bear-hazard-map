@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>徳島県 クマ出没ハザードマップ</title>
+  <link rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header id="header">
+    <h1>徳島県 クマ出没ハザードマップ</h1>
+    <p>
+      過去の出没地点と<strong>地形・土地利用が似た場所</strong>を類似度スコアで推定したヒートマップです。
+      出没データは少数のため、これは統計的な相対リスクの目安であり、スコアが低い場所の安全を保証するものではありません。
+    </p>
+  </header>
+  <div id="map"></div>
+  <footer id="footer">
+    出典: 国土数値情報（行政区域・河川・土地利用細分メッシュ）／国土地理院（標高タイル・地図タイル）を加工して作成。
+    手法: presence-only 特徴空間類似度（マハラノビス距離 + Gaussianカーネル）。
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>

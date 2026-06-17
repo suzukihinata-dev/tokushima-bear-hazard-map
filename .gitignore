@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 国土数値情報・DEM 等の生データ（容量大のため Git 管理外）
+data/raw/
+# 中間・成果物（配信用コピーは docs/data に置く）
+data/processed/
+
+# OS
+.DS_Store
