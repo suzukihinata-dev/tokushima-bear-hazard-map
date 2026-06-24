@@ -9,26 +9,54 @@ L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", {
   maxZoom: 18,
 }).addTo(map);
 
-// スコア(0-1) -> 色（青→赤）
-function hazardColor(s) {
-  const stops = [
-    [0.0, [44, 123, 182]],
-    [0.25, [171, 217, 233]],
-    [0.5, [255, 255, 191]],
-    [0.75, [253, 174, 97]],
-    [1.0, [215, 25, 28]],
-  ];
-  for (let i = 1; i < stops.length; i++) {
-    if (s <= stops[i][0]) {
-      const [a, ca] = stops[i - 1];
-      const [b, cb] = stops[i];
-      const t = (s - a) / (b - a);
-      const c = ca.map((v, k) => Math.round(v + t * (cb[k] - v)));
-      return `rgb(${c[0]},${c[1]},${c[2]})`;
+const hazardVisualPane = map.createPane("hazard-visual-pane");
+hazardVisualPane.style.zIndex = "340";
+hazardVisualPane.style.pointerEvents = "none";
+
+const hazardHitPane = map.createPane("hazard-hit-pane");
+hazardHitPane.style.zIndex = "345";
+
+const hazardHitRenderer = L.svg({ pane: "hazard-hit-pane", padding: 0.25 });
+const HAZARD_OVERLAY_MAX_SCALE = 20;
+const HAZARD_OVERLAY_MIN_SCALE = 14;
+const HAZARD_SMOOTH_RADIUS = 2;
+const HAZARD_SMOOTH_SIGMA = 1.1;
+const HAZARD_DISPLAY_GAMMA = 0.7;
+
+const HAZARD_STOPS = [
+  [0.0, [44, 123, 182]],
+  [0.25, [171, 217, 233]],
+  [0.5, [255, 241, 170]],
+  [0.75, [243, 127, 77]],
+  [1.0, [150, 0, 28]],
+];
+
+function hazardRgb(s) {
+  const score = Math.pow(Math.max(0, Math.min(1, s)), HAZARD_DISPLAY_GAMMA);
+  for (let i = 1; i < HAZARD_STOPS.length; i++) {
+    if (score <= HAZARD_STOPS[i][0]) {
+      const [a, ca] = HAZARD_STOPS[i - 1];
+      const [b, cb] = HAZARD_STOPS[i];
+      const t = (score - a) / (b - a);
+      return ca.map((v, k) => Math.round(v + t * (cb[k] - v)));
     }
   }
-  return "rgb(215,25,28)";
+  return [150, 0, 28];
 }
+
+// スコア(0-1) -> 色（青→赤）
+function hazardColor(s) {
+  const [r, g, b] = hazardRgb(s);
+  return `rgb(${r},${g},${b})`;
+}
+
+const HAZARD_PALETTE = Array.from({ length: 256 }, (_, index) => {
+  const score = index / 255;
+  return {
+    rgb: hazardRgb(score),
+    alpha: Math.round(255 * (0.22 + 0.72 * Math.pow(score, HAZARD_DISPLAY_GAMMA))),
+  };
+});
 
 // 痕跡種別 -> 色
 const EVIDENCE_COLORS = {
@@ -112,13 +140,231 @@ function weatherHtml(p) {
   return `<div class="popup-meta">${rows.join("<br>")}</div>`;
 }
 
+function buildHazardSurface(grid) {
+  const cells = grid.features.map((feature) => {
+    const ring = feature.geometry.coordinates[0];
+    let west = Infinity;
+    let east = -Infinity;
+    let south = Infinity;
+    let north = -Infinity;
+
+    for (const [lon, lat] of ring) {
+      west = Math.min(west, lon);
+      east = Math.max(east, lon);
+      south = Math.min(south, lat);
+      north = Math.max(north, lat);
+    }
+
+    return {
+      west,
+      east,
+      south,
+      north,
+      centerLon: (west + east) / 2,
+      centerLat: (south + north) / 2,
+      score: feature.properties.score,
+    };
+  });
+
+  if (cells.length === 0) return null;
+
+  const lonKeys = [...new Set(cells.map((cell) => cell.centerLon.toFixed(6)))].sort(
+    (a, b) => Number(a) - Number(b)
+  );
+  const latKeys = [...new Set(cells.map((cell) => cell.centerLat.toFixed(6)))].sort(
+    (a, b) => Number(a) - Number(b)
+  );
+
+  const centerLons = lonKeys.map(Number);
+  const centerLats = latKeys.map(Number);
+  const xIndex = new Map(lonKeys.map((key, index) => [key, index]));
+  const yIndex = new Map(latKeys.map((key, index) => [key, index]));
+  const scores = Array.from({ length: centerLats.length }, () => Array(centerLons.length).fill(null));
+  const occupied = Array.from({ length: centerLats.length }, () => Array(centerLons.length).fill(false));
+
+  for (const cell of cells) {
+    const x = xIndex.get(cell.centerLon.toFixed(6));
+    const y = yIndex.get(cell.centerLat.toFixed(6));
+    scores[y][x] = cell.score;
+    occupied[y][x] = true;
+  }
+
+  return {
+    cols: centerLons.length,
+    rows: centerLats.length,
+    westMin: Math.min(...cells.map((cell) => cell.west)),
+    eastMax: Math.max(...cells.map((cell) => cell.east)),
+    southMin: Math.min(...cells.map((cell) => cell.south)),
+    northMax: Math.max(...cells.map((cell) => cell.north)),
+    cellWidth: cells[0].east - cells[0].west,
+    cellHeight: cells[0].north - cells[0].south,
+    centerLons,
+    centerLats,
+    scores,
+    occupied,
+  };
+}
+
+function boundaryPolygons(boundaryData) {
+  const polygons = [];
+
+  function collect(entry) {
+    if (!entry) return;
+    if (entry.type === "FeatureCollection") {
+      for (const feature of entry.features) collect(feature);
+      return;
+    }
+    if (entry.type === "Feature") {
+      collect(entry.geometry);
+      return;
+    }
+    if (entry.type === "GeometryCollection") {
+      for (const geometry of entry.geometries) collect(geometry);
+      return;
+    }
+    if (entry.type === "Polygon") {
+      polygons.push(entry.coordinates);
+      return;
+    }
+    if (entry.type === "MultiPolygon") {
+      polygons.push(...entry.coordinates);
+    }
+  }
+
+  collect(boundaryData);
+
+  return polygons;
+}
+
+function traceBoundaryPath(ctx, polygons, surface, width, height) {
+  const lonSpan = surface.eastMax - surface.westMin;
+  const latSpan = surface.northMax - surface.southMin;
+  if (!lonSpan || !latSpan) return;
+
+  ctx.beginPath();
+  for (const polygon of polygons) {
+    for (const ring of polygon) {
+      if (!ring.length) continue;
+      ring.forEach(([lon, lat], index) => {
+        const x = ((lon - surface.westMin) / lonSpan) * width;
+        const y = ((surface.northMax - lat) / latSpan) * height;
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+    }
+  }
+}
+
+function hazardRasterScale(surface) {
+  const longestEdge = Math.max(surface.cols, surface.rows);
+  return Math.max(
+    HAZARD_OVERLAY_MIN_SCALE,
+    Math.min(HAZARD_OVERLAY_MAX_SCALE, Math.floor(1800 / longestEdge))
+  );
+}
+
+function sampleHazardSurface(surface, gx, gy) {
+  let weightSum = 0;
+  let scoreSum = 0;
+  let nearestDist2 = Infinity;
+  const centerX = Math.round(gx);
+  const centerY = Math.round(gy);
+
+  for (let y = centerY - HAZARD_SMOOTH_RADIUS; y <= centerY + HAZARD_SMOOTH_RADIUS; y++) {
+    if (y < 0 || y >= surface.rows) continue;
+    for (let x = centerX - HAZARD_SMOOTH_RADIUS; x <= centerX + HAZARD_SMOOTH_RADIUS; x++) {
+      if (x < 0 || x >= surface.cols) continue;
+      const score = surface.scores[y][x];
+      if (score === null) continue;
+
+      const dx = gx - x;
+      const dy = gy - y;
+      const dist2 = dx * dx + dy * dy;
+      nearestDist2 = Math.min(nearestDist2, dist2);
+
+      const weight = Math.exp(-dist2 / (2 * HAZARD_SMOOTH_SIGMA * HAZARD_SMOOTH_SIGMA));
+      weightSum += weight;
+      scoreSum += score * weight;
+    }
+  }
+
+  if (weightSum === 0 || nearestDist2 > 5.5) {
+    return null;
+  }
+
+  return scoreSum / weightSum;
+}
+
+function renderHazardOverlay(surface, boundaryData) {
+  const scale = hazardRasterScale(surface);
+  const width = surface.cols * scale;
+  const height = surface.rows * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const ctx = canvas.getContext("2d");
+  const image = ctx.createImageData(width, height);
+  const pixels = image.data;
+
+  for (let py = 0; py < height; py++) {
+    const gy = surface.rows - (py + 0.5) / scale - 0.5;
+    for (let px = 0; px < width; px++) {
+      const gx = (px + 0.5) / scale - 0.5;
+      const score = sampleHazardSurface(surface, gx, gy);
+      if (score === null) continue;
+
+      const palette = HAZARD_PALETTE[Math.max(0, Math.min(255, Math.round(score * 255)))];
+      const offset = (py * width + px) * 4;
+      pixels[offset] = palette.rgb[0];
+      pixels[offset + 1] = palette.rgb[1];
+      pixels[offset + 2] = palette.rgb[2];
+      pixels[offset + 3] = palette.alpha;
+    }
+  }
+
+  ctx.putImageData(image, 0, 0);
+
+  const blurredCanvas = document.createElement("canvas");
+  blurredCanvas.width = width;
+  blurredCanvas.height = height;
+  const blurredCtx = blurredCanvas.getContext("2d");
+  blurredCtx.filter = "blur(0.8px)";
+  blurredCtx.drawImage(canvas, 0, 0);
+  blurredCtx.filter = "none";
+
+  const polygons = boundaryPolygons(boundaryData);
+  if (polygons.length) {
+    blurredCtx.globalCompositeOperation = "destination-in";
+    blurredCtx.fillStyle = "#fff";
+    traceBoundaryPath(blurredCtx, polygons, surface, width, height);
+    blurredCtx.fill("evenodd");
+    blurredCtx.globalCompositeOperation = "source-over";
+  }
+
+  const bounds = L.latLngBounds(
+    [surface.southMin, surface.westMin],
+    [surface.northMax, surface.eastMax]
+  );
+
+  return L.imageOverlay(blurredCanvas.toDataURL("image/png"), bounds, {
+    pane: "hazard-visual-pane",
+    interactive: false,
+    opacity: 1,
+  });
+}
+
 // --- ハザード層 ---
-const hazardLayer = L.geoJSON(null, {
-  style: (f) => ({
+const hazardVisualLayer = L.layerGroup();
+
+const hazardHitLayer = L.geoJSON(null, {
+  renderer: hazardHitRenderer,
+  style: () => ({
     stroke: false,
-    fillColor: hazardColor(f.properties.score),
-    // 低スコアは薄く、高スコアは濃く（ヒートマップらしさ）
-    fillOpacity: 0.15 + 0.6 * f.properties.score,
+    fill: true,
+    fillOpacity: 0,
+    opacity: 0,
   }),
   onEachFeature: (f, layer) => {
     const p = f.properties;
@@ -130,6 +376,8 @@ const hazardLayer = L.geoJSON(null, {
     );
   },
 });
+
+const hazardLayer = L.layerGroup([hazardVisualLayer, hazardHitLayer]);
 
 // --- 出没点層 ---
 const sightingLayer = L.geoJSON(null, {
@@ -197,9 +445,16 @@ for (const control of [seasonFilter, monthFilter, foodSeasonFilter]) {
 Promise.all([
   fetch("data/grid_scores.geojson").then((r) => r.json()),
   fetch("data/sightings.geojson").then((r) => r.json()),
-]).then(([grid, sightings]) => {
+  fetch("data/pref_boundary.geojson").then((r) => r.json()),
+]).then(([grid, sightings, boundary]) => {
   allSightings = sightings;
-  hazardLayer.addData(grid).addTo(map);
+  hazardVisualLayer.clearLayers();
+  const surface = buildHazardSurface(grid);
+  if (surface) {
+    hazardVisualLayer.addLayer(renderHazardOverlay(surface, boundary));
+  }
+  hazardHitLayer.addData(grid);
+  hazardLayer.addTo(map);
   renderSightings();
   sightingLayer.addTo(map);
   map.fitBounds(sightingLayer.getBounds().pad(0.4));
@@ -207,7 +462,7 @@ Promise.all([
 
 // --- レイヤ切替 ---
 L.control
-  .layers(null, { ハザードヒートマップ: hazardLayer, 出没地点: sightingLayer }, { collapsed: false })
+  .layers(null, { ハザードグラデーション: hazardLayer, 出没地点: sightingLayer }, { collapsed: false })
   .addTo(map);
 
 // --- 凡例 ---

@@ -157,6 +157,12 @@ def _river_distance(grid: gpd.GeoDataFrame) -> pd.DataFrame:
 def main() -> int:
     print("[build_features]")
     boundary = _load_boundary()
+    C.PROCESSED.mkdir(parents=True, exist_ok=True)
+    C.DOCS_DATA.mkdir(parents=True, exist_ok=True)
+    boundary_out = C.PROCESSED / "pref_boundary.geojson"
+    boundary.to_file(boundary_out, driver="GeoJSON")
+    boundary.to_file(C.DOCS_DATA / "pref_boundary.geojson", driver="GeoJSON")
+    print(f"  県境ポリゴン: {boundary_out}")
     grid = _build_grid(boundary)
     for feat in (_terrain_features(grid), _landuse_features(grid), _river_distance(grid)):
         if not feat.empty:
@@ -170,7 +176,6 @@ def main() -> int:
             grid[col] = grid[col].fillna(fill)
     if "dist_river" in grid:
         grid["dist_river"] = grid["dist_river"].fillna(grid["dist_river"].max())
-    C.PROCESSED.mkdir(parents=True, exist_ok=True)
     out = C.PROCESSED / "grid_features.geojson"
     grid.to_file(out, driver="GeoJSON")
     print(f"  -> {out} ({len(grid)} メッシュ)")
