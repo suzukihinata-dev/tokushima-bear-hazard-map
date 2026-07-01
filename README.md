@@ -17,6 +17,8 @@
 |--------|------|--------|
 | elev | 平均標高 | 国土地理院 標高タイル(DEM10B) |
 | slope | 平均傾斜 | 同上（DEMから算出） |
+| slope_p90 | 傾斜の90パーセンタイル | 同上（DEMから算出） |
+| steep_ratio | 30度以上の急斜面ピクセル率 | 同上（DEMから算出） |
 | relief | 起伏（メッシュ内標高の標準偏差） | 同上 |
 | forest | 森林率 | 国土数値情報 土地利用細分メッシュ L03-b |
 | building | 建物用地率 | 同上 |
@@ -25,6 +27,11 @@
 
 出没地点には日付から `year` / `month` / `season` / `activity_period` /
 `is_food_season` / `is_denning_season` / `moon_phase` を付与します。
+また、`observed_elev` 列、または数値として入った `geo_confidence` 列がある場合は、
+それを**出没地点の観測標高**として扱い、近傍メッシュの中から標高整合が最も高い
+メッシュへ陽性サンプルを補正します。
+出没点の説明情報としては、国土数値情報 W05 河川データから**点そのものから河川までの厳密距離**
+も計算してポップアップに表示します。
 任意で `data/weather_daily.csv` を置くと、同日の気象データも出没地点に結合され、
 Webマップのポップアップに表示されます。
 
@@ -75,12 +82,15 @@ python -m http.server 8000 --directory docs
 ```
 
 ## 手法（スコアリング）
-1. 各メッシュの特徴ベクトル `x = [elev, slope, relief, forest, building, agri, log(dist_river)]`
+1. 各メッシュの特徴ベクトル
+   `x = [elev, slope, slope_p90, steep_ratio, relief, forest, building, agri, log(dist_river)]`
 2. 全メッシュ統計で z-score 標準化
 3. 全メッシュから正則化付き共分散 Σ を推定
-4. 各メッシュのスコア `= mean_i exp( −0.5 · d_M(x, pᵢ)² / h² )`
-   （pᵢ: 出没メッシュ、d_M: マハラノビス距離、h: バンド幅）
-5. 0–1 に正規化して GeoJSON へ
+4. 各出没点を近傍メッシュへ仮対応させ、観測標高がある場合は標高差と距離の両方で
+   最も整合するメッシュへ補正する
+5. 各メッシュのスコア `= mean_i exp( −0.5 · d_M(x, pᵢ)² / h² )`
+   （pᵢ: 出没サンプル、d_M: マハラノビス距離、h: バンド幅）
+6. 0–1 に正規化して GeoJSON へ
 - 妥当性確認: leave-one-out による出没メッシュの平均パーセンタイル（実行時にログ出力）
 
 ## 天気・季節データの追加
@@ -102,4 +112,5 @@ date,station,station_lat,station_lon,weather,temp_avg,temp_max,temp_min,precipit
 ## 出典・ライセンス
 - 国土数値情報（行政区域・河川・土地利用細分メッシュ）／国土交通省
 - 地理院タイル（標高タイル・淡色地図）／国土地理院
-- 出没記録は公開情報をもとに手動整理。位置は地名・ランドマークからの近似値（`geo_confidence` に精度を記載）。
+- 出没記録は公開情報をもとに手動整理。標高情報がある場合は `observed_elev` として、
+  互換入力では数値の `geo_confidence` として扱えます。

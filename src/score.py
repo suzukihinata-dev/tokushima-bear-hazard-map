@@ -12,22 +12,52 @@ from __future__ import annotations
 import shutil
 
 import geopandas as gpd
-import jismesh.utils as ju
 import numpy as np
 import pandas as pd
 
 import config as C
+from sightings_utils import (
+    extract_geo_confidence_label,
+    extract_observed_elev,
+    match_sightings_to_grid,
+    point_river_distances,
+)
 import weather_features
 
-FEATURES = ["elev", "slope", "relief", "forest", "building", "agri", "dist_river"]
+FEATURES = [
+    "elev",
+    "slope",
+    "slope_p90",
+    "steep_ratio",
+    "relief",
+    "forest",
+    "building",
+    "agri",
+    "dist_river",
+]
 BANDWIDTH = 1.0  # Gaussian カーネルのバンド幅
 
 
+def _normalize_sightings(sightings: pd.DataFrame) -> pd.DataFrame:
+    out = sightings.copy()
+    out["observed_elev"] = out.apply(extract_observed_elev, axis=1)
+    if "geo_confidence" in out.columns:
+        labels = out.apply(extract_geo_confidence_label, axis=1)
+        if labels.notna().any():
+            out["geo_confidence"] = labels
+        else:
+            out = out.drop(columns=["geo_confidence"])
+    return out
+
+
+def _transform_features(X: np.ndarray) -> np.ndarray:
+    out = X.astype(float).copy()
+    out[:, FEATURES.index("dist_river")] = np.log1p(out[:, FEATURES.index("dist_river")])
+    return out
+
+
 def _feature_matrix(grid: gpd.GeoDataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    X = grid[FEATURES].to_numpy(dtype=float).copy()
-    # 河川距離は裾の長い分布なので対数化
-    j = FEATURES.index("dist_river")
-    X[:, j] = np.log1p(X[:, j])
+    X = _transform_features(grid[FEATURES].to_numpy(dtype=float))
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
     sd[sd == 0] = 1.0
@@ -51,22 +81,48 @@ def _similarity(Z: np.ndarray, P: np.ndarray, cov_inv: np.ndarray, h: float) -> 
     return scores / len(P)
 
 
-def _assign_presence(grid: gpd.GeoDataFrame, sightings: pd.DataFrame) -> np.ndarray:
-    codes = ju.to_meshcode(
-        sightings["lat"].to_numpy(), sightings["lon"].to_numpy(), C.MESH_LEVEL
-    ).astype(str)
-    code_to_idx = {c: i for i, c in enumerate(grid["meshcode"])}
-    idx = sorted({code_to_idx[c] for c in codes if c in code_to_idx})
-    return np.array(idx, dtype=int)
+def _match_presence_samples(
+    grid: gpd.GeoDataFrame,
+    sightings: pd.DataFrame,
+    mu: np.ndarray,
+    sd: np.ndarray,
+) -> tuple[np.ndarray, pd.DataFrame, dict[str, float]]:
+    grid_raw = grid[FEATURES].to_numpy(dtype=float)
+    matches = match_sightings_to_grid(grid, sightings, C.MESH_LEVEL)
+
+    samples: list[np.ndarray] = []
+
+    for row_idx, match in matches.iterrows():
+        observed_elev = sightings.iloc[row_idx]["observed_elev"]
+        best_idx = int(match["matched_idx"])
+        sample = grid_raw[best_idx].copy()
+        if pd.notna(observed_elev):
+            sample[FEATURES.index("elev")] = float(observed_elev)
+        samples.append(sample)
+
+    P = _transform_features(np.vstack(samples))
+    P = (P - mu) / sd
+    diagnostics = {
+        "sample_count": float(len(samples)),
+        "unique_meshes": float(matches["matched_meshcode"].nunique()),
+        "adjusted_count": float(matches["mesh_adjusted"].sum()),
+        "mean_move_km": float(matches["mesh_center_distance_km"].mean()),
+        "mean_elev_gap_m": float(matches["elev_gap_m"].dropna().mean())
+        if matches["elev_gap_m"].notna().any()
+        else float("nan"),
+    }
+    return P, matches, diagnostics
 
 
-def _loo_check(Z: np.ndarray, pres_idx: np.ndarray, cov_inv: np.ndarray) -> float:
+def _loo_check(Z: np.ndarray, P: np.ndarray, matched_idx: np.ndarray, cov_inv: np.ndarray) -> float:
     """leave-one-out: 各出没メッシュが全体で上位何%に入るかの平均。"""
+    if len(P) <= 1:
+        return float("nan")
     pcts = []
-    for k in range(len(pres_idx)):
-        others = Z[np.delete(pres_idx, k)]
+    for k in range(len(P)):
+        others = np.delete(P, k, axis=0)
         s = _similarity(Z, others, cov_inv, BANDWIDTH)
-        rank = (s < s[pres_idx[k]]).mean()  # 自分より低いスコアの割合
+        rank = (s < s[matched_idx[k]]).mean()  # 自分より低いスコアの割合
         pcts.append(rank)
     return float(np.mean(pcts)) if pcts else float("nan")
 
@@ -76,17 +132,27 @@ def main() -> int:
     grid = gpd.read_file(C.PROCESSED / "grid_features.geojson")
     sightings = pd.read_csv(C.SIGHTINGS_CSV)
     sightings = weather_features.enrich_sightings(sightings)
+    sightings = _normalize_sightings(sightings)
+    sightings["point_dist_river"] = point_river_distances(sightings)
 
-    Z, _, _ = _feature_matrix(grid)
+    Z, mu, sd = _feature_matrix(grid)
     cov_inv = _cov_inv(Z)
-    pres_idx = _assign_presence(grid, sightings)
-    print(f"  出没メッシュ数: {len(pres_idx)} / 全メッシュ {len(grid)}")
+    P, matches, diag = _match_presence_samples(grid, sightings, mu, sd)
+    matched_idx = matches["matched_idx"].to_numpy(dtype=int)
+    print(
+        "  出没サンプル:"
+        f" {int(diag['sample_count'])}件 / {int(diag['unique_meshes'])}メッシュ"
+        f" / 標高補正で再割当 {int(diag['adjusted_count'])}件"
+    )
+    print(f"  平均メッシュ中心距離: {diag['mean_move_km']:.2f} km")
+    if not np.isnan(diag["mean_elev_gap_m"]):
+        print(f"  割当メッシュ平均との差標高: {diag['mean_elev_gap_m']:.1f} m")
 
-    raw = _similarity(Z, Z[pres_idx], cov_inv, BANDWIDTH)
+    raw = _similarity(Z, P, cov_inv, BANDWIDTH)
     score = (raw - raw.min()) / (raw.max() - raw.min() + 1e-12)
     grid["score"] = np.round(score, 4)
 
-    loo = _loo_check(Z, pres_idx, cov_inv)
+    loo = _loo_check(Z, P, matched_idx, cov_inv)
     print(f"  leave-one-out 平均パーセンタイル: {loo*100:.1f}% (高いほど良い)")
 
     # 出力（軽量化のため小数桁を抑える）
@@ -94,6 +160,28 @@ def main() -> int:
         grid[col] = grid[col].round(2)
     C.PROCESSED.mkdir(parents=True, exist_ok=True)
     grid.to_file(C.PROCESSED / "grid_scores.geojson", driver="GeoJSON")
+
+    matched_grid = grid.iloc[matched_idx].reset_index(drop=True)
+    sightings = sightings.reset_index(drop=True).copy()
+    sightings["matched_meshcode"] = matches["matched_meshcode"].to_numpy()
+    sightings["matched_score"] = np.round(score[matched_idx], 4)
+    sightings["mesh_adjusted"] = matches["mesh_adjusted"].to_numpy()
+    sightings["mesh_center_distance_km"] = matches["mesh_center_distance_km"].round(2).to_numpy()
+    sightings["mesh_elev_gap_m"] = matches["elev_gap_m"].round(1).to_numpy()
+    sightings["point_dist_river"] = sightings["point_dist_river"].round(1)
+    context_columns = {
+        "mesh_elev": "elev",
+        "mesh_slope": "slope",
+        "mesh_slope_p90": "slope_p90",
+        "mesh_steep_ratio": "steep_ratio",
+        "mesh_relief": "relief",
+        "mesh_forest": "forest",
+        "mesh_building": "building",
+        "mesh_agri": "agri",
+        "mesh_dist_river": "dist_river",
+    }
+    for out_col, grid_col in context_columns.items():
+        sightings[out_col] = matched_grid[grid_col].round(2).to_numpy()
 
     sg = gpd.GeoDataFrame(
         sightings,

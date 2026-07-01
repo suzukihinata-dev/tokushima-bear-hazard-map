@@ -123,6 +123,21 @@ function fmt(value, suffix = "", digits = 1) {
   return `${Number(value).toFixed(digits)}${suffix}`;
 }
 
+function numOrNull(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function textOrNull(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  if (["undefined", "null", "none", "nan", "na", "n/a"].includes(text.toLowerCase())) {
+    return null;
+  }
+  return text;
+}
+
 function weatherHtml(p) {
   const rows = [
     `季節: ${p.season_label || "不明"} / ${p.activity_period_label || "不明"}`,
@@ -138,6 +153,43 @@ function weatherHtml(p) {
     rows.push(`観測所: ${p.station}${dist}`);
   }
   return `<div class="popup-meta">${rows.join("<br>")}</div>`;
+}
+
+function sightingMetaLine(p) {
+  const details = [`<span class="popup-ev" style="background:${EVIDENCE_COLORS[p.evidence_type] || "#888"}">${p.evidence_type}</span>`];
+  const observedElev = numOrNull(p.observed_elev);
+  const geoConfidence = textOrNull(p.geo_confidence);
+  if (observedElev !== null) {
+    details.push(`<small>観測標高: ${fmt(observedElev, "m")}</small>`);
+  } else if (geoConfidence) {
+    details.push(`<small>位置精度: ${geoConfidence}</small>`);
+  }
+  return details.join(" ");
+}
+
+function landscapeHtml(p) {
+  const rows = [];
+  const risk = numOrNull(p.matched_score);
+  const pointRiver = numOrNull(p.point_dist_river);
+  const river = numOrNull(p.mesh_dist_river);
+  const slope = numOrNull(p.mesh_slope);
+  const steepRatio = numOrNull(p.mesh_steep_ratio);
+  const forest = numOrNull(p.mesh_forest);
+  const meshElev = numOrNull(p.mesh_elev);
+  const elevGap = numOrNull(p.mesh_elev_gap_m);
+  const centerDistance = numOrNull(p.mesh_center_distance_km);
+
+  if (risk !== null) rows.push(`地点リスク: ${risk.toFixed(2)}`);
+  if (pointRiver !== null) rows.push(`河川までの実距離: ${fmt(pointRiver, "m", 0)}`);
+  else if (river !== null) rows.push(`最近隣河川: ${fmt(river, "m", 0)}`);
+  if (slope !== null) rows.push(`周辺傾斜: ${fmt(slope, "°")}`);
+  if (steepRatio !== null) rows.push(`急斜面率(30°以上): ${fmt(steepRatio * 100, "%", 0)}`);
+  if (forest !== null) rows.push(`周辺森林率: ${fmt(forest * 100, "%", 0)}`);
+  if (meshElev !== null) rows.push(`周辺メッシュ標高: ${fmt(meshElev, "m")}`);
+  if (elevGap !== null) rows.push(`標高差: ${fmt(elevGap, "m")}`);
+  if (centerDistance !== null) rows.push(`メッシュ中心距離: ${fmt(centerDistance, "km", 2)}`);
+
+  return rows.length ? `<div class="popup-meta">${rows.join("<br>")}</div>` : "";
 }
 
 function buildHazardSurface(grid) {
@@ -391,13 +443,12 @@ const sightingLayer = L.geoJSON(null, {
     }),
   onEachFeature: (f, layer) => {
     const p = f.properties;
-    const col = EVIDENCE_COLORS[p.evidence_type] || "#888";
     layer.bindPopup(
       `<div class="popup-date">${p.date}</div>` +
         `<div class="popup-place">${p.place}</div>` +
         `<div>${p.situation}</div>` +
-        `<div style="margin-top:4px"><span class="popup-ev" style="background:${col}">${p.evidence_type}</span> ` +
-        `<small>位置精度: ${p.geo_confidence}</small></div>` +
+        `<div style="margin-top:4px">${sightingMetaLine(p)}</div>` +
+        landscapeHtml(p) +
         weatherHtml(p)
     );
   },

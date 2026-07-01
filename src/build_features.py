@@ -1,6 +1,7 @@
 """徳島県を3次メッシュでグリッド化し、地理的特徴量を集計する。
 
-特徴量: 標高(elev) / 傾斜(slope) / 起伏(relief) /
+特徴量: 標高(elev) / 平均傾斜(slope) / 上位傾斜(slope_p90) /
+        急斜面率(steep_ratio) / 起伏(relief) /
         森林率(forest) / 建物用地率(building) / 農地率(agri) /
         最近隣河川距離(dist_river)
 出力: data/processed/grid_features.geojson
@@ -45,7 +46,7 @@ def _build_grid(boundary: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         {"meshcode": codes.astype(str)}, geometry=geom, crs=C.CRS_WGS84
     )
     # 県内（重心が県境内）のメッシュのみ残す
-    cent = grid.geometry.centroid
+    cent = grid.geometry.representative_point()
     inside = cent.within(boundary.geometry.iloc[0])
     grid = grid[inside].reset_index(drop=True)
     print(f"  グリッド: {len(grid)} メッシュ（3次, ≒1km）")
@@ -56,13 +57,17 @@ def _terrain_features(grid: gpd.GeoDataFrame) -> pd.DataFrame:
     dem = gsi_dem.sample_dem(C.BBOX, C.DEM_ZOOM)
     if dem.empty:
         print("  !! DEM が取得できませんでした")
-        return pd.DataFrame(columns=["meshcode", "elev", "slope", "relief"])
+        return pd.DataFrame(
+            columns=["meshcode", "elev", "slope", "slope_p90", "steep_ratio", "relief"]
+        )
     dem["meshcode"] = ju.to_meshcode(
         dem["lat"].to_numpy(), dem["lon"].to_numpy(), C.MESH_LEVEL
     ).astype(str)
     agg = dem.groupby("meshcode").agg(
         elev=("elev", "mean"),
         slope=("slope", "mean"),
+        slope_p90=("slope", lambda s: float(s.quantile(0.9))),
+        steep_ratio=("slope", lambda s: float((s >= 30).mean())),
         relief=("elev", "std"),
     ).reset_index()
     agg["relief"] = agg["relief"].fillna(0.0)
@@ -142,9 +147,8 @@ def _river_distance(grid: gpd.GeoDataFrame) -> pd.DataFrame:
         rivers = rivers.set_crs(C.CRS_WGS84)
     rivers = rivers[rivers.geometry.type.isin(["LineString", "MultiLineString"])]
     rivers_m = rivers.to_crs(C.CRS_METRIC)
-    cent = grid.copy()
-    cent["geometry"] = cent.geometry.centroid
-    cent_m = cent.to_crs(C.CRS_METRIC)
+    cent_m = grid.to_crs(C.CRS_METRIC).copy()
+    cent_m["geometry"] = cent_m.geometry.centroid
     joined = gpd.sjoin_nearest(
         cent_m[["meshcode", "geometry"]], rivers_m[["geometry"]],
         distance_col="dist_river",
@@ -169,7 +173,7 @@ def main() -> int:
             grid = grid.merge(feat, on="meshcode", how="left")
     # 欠損補完
     for col, fill in [
-        ("elev", 0.0), ("slope", 0.0), ("relief", 0.0),
+        ("elev", 0.0), ("slope", 0.0), ("slope_p90", 0.0), ("steep_ratio", 0.0), ("relief", 0.0),
         ("forest", 0.0), ("building", 0.0), ("agri", 0.0),
     ]:
         if col in grid:

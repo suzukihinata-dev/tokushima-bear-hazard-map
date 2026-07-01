@@ -7,6 +7,17 @@ from datetime import date, datetime
 from math import atan2, cos, radians, sin, sqrt
 from pathlib import Path
 
+import geopandas as gpd
+import pandas as pd
+
+import config as C
+from sightings_utils import (
+    extract_geo_confidence_label,
+    extract_observed_elev,
+    match_sightings_to_grid,
+    point_river_distances,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 SIGHTINGS_CSV = ROOT / "data" / "sightings.csv"
 WEATHER_DAILY_CSV = ROOT / "data" / "weather_daily.csv"
@@ -39,6 +50,18 @@ WEATHER_COLUMNS = [
     "sunshine",
     "wind_speed",
 ]
+
+GRID_CONTEXT_COLUMNS = {
+    "mesh_elev": "elev",
+    "mesh_slope": "slope",
+    "mesh_slope_p90": "slope_p90",
+    "mesh_steep_ratio": "steep_ratio",
+    "mesh_relief": "relief",
+    "mesh_forest": "forest",
+    "mesh_building": "building",
+    "mesh_agri": "agri",
+    "mesh_dist_river": "dist_river",
+}
 
 
 def _season(month: int) -> str:
@@ -97,6 +120,39 @@ def _read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(fp))
 
 
+def _sighting_grid_context(sightings: list[dict]) -> list[dict]:
+    grid_path = C.PROCESSED / "grid_scores.geojson"
+    if not sightings or not grid_path.exists():
+        return [{} for _ in sightings]
+
+    grid = gpd.read_file(grid_path)
+    df = pd.DataFrame(sightings)
+    df["observed_elev"] = df.apply(extract_observed_elev, axis=1)
+    df["point_dist_river"] = point_river_distances(df)
+    matches = match_sightings_to_grid(grid, df, C.MESH_LEVEL)
+    matched_idx = matches["matched_idx"].to_numpy(dtype=int)
+    matched_grid = grid.iloc[matched_idx].reset_index(drop=True)
+
+    contexts = []
+    for idx in range(len(df)):
+        ctx = {
+            "matched_meshcode": matches.at[idx, "matched_meshcode"],
+            "matched_score": round(float(matched_grid.at[idx, "score"]), 4),
+            "mesh_adjusted": bool(matches.at[idx, "mesh_adjusted"]),
+            "mesh_center_distance_km": round(float(matches.at[idx, "mesh_center_distance_km"]), 2),
+        }
+        elev_gap = matches.at[idx, "elev_gap_m"]
+        if pd.notna(elev_gap):
+            ctx["mesh_elev_gap_m"] = round(float(elev_gap), 1)
+        point_dist_river = df.at[idx, "point_dist_river"]
+        if pd.notna(point_dist_river):
+            ctx["point_dist_river"] = round(float(point_dist_river), 1)
+        for out_col, grid_col in GRID_CONTEXT_COLUMNS.items():
+            ctx[out_col] = round(float(matched_grid.at[idx, grid_col]), 2)
+        contexts.append(ctx)
+    return contexts
+
+
 def _weather_for_sighting(sighting: dict, weather_rows: list[dict]) -> dict:
     rows = [r for r in weather_rows if r.get("date") == sighting["date"]]
     if not rows:
@@ -127,14 +183,23 @@ def _weather_for_sighting(sighting: dict, weather_rows: list[dict]) -> dict:
 def main() -> int:
     sightings = _read_csv(SIGHTINGS_CSV)
     weather_rows = _read_csv(WEATHER_DAILY_CSV)
+    grid_contexts = _sighting_grid_context(sightings)
     features = []
 
-    for row in sightings:
+    for row, grid_context in zip(sightings, grid_contexts, strict=False):
         day = datetime.strptime(row["date"], "%Y-%m-%d").date()
         month = day.month
         season = _season(month)
         activity = _activity_period(month)
         props = {k: _coerce(v) for k, v in row.items()}
+        observed_elev = extract_observed_elev(props)
+        if observed_elev is not None:
+            props["observed_elev"] = round(observed_elev, 1)
+        geo_confidence = extract_geo_confidence_label(props)
+        if geo_confidence is not None:
+            props["geo_confidence"] = geo_confidence
+        else:
+            props.pop("geo_confidence", None)
         props.update(
             {
                 "year": day.year,
@@ -149,6 +214,7 @@ def main() -> int:
                 "moon_phase": round(_moon_phase_index(day), 3),
             }
         )
+        props.update(grid_context)
         props.update(_weather_for_sighting(row, weather_rows))
         features.append(
             {
