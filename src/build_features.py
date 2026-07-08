@@ -15,6 +15,7 @@ import jismesh.utils as ju
 import numpy as np
 import pandas as pd
 from shapely.geometry import box
+from shapely.prepared import prep
 
 import config as C
 import gsi_dem
@@ -75,9 +76,14 @@ def _build_grid(boundary: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     grid = gpd.GeoDataFrame(
         {"meshcode": codes.astype(str)}, geometry=geom, crs=C.CRS_WGS84
     )
-    # 四国本島内（重心が境界内）のメッシュのみ残す
-    cent = grid.geometry.representative_point()
-    inside = cent.within(boundary.geometry.iloc[0])
+    # 本島境界と交差するメッシュを残し、表示時は境界ポリゴンでクリップする。
+    # これにより海岸や岬の先端が半セル分欠けるのを防ぐ。
+    prepared_boundary = prep(boundary.geometry.iloc[0])
+    inside = np.fromiter(
+        (prepared_boundary.intersects(geom) for geom in grid.geometry),
+        dtype=bool,
+        count=len(grid),
+    )
     grid = grid[inside].reset_index(drop=True)
     print(f"  グリッド: {len(grid)} メッシュ（3次, ≒1km）")
     return grid

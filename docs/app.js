@@ -215,6 +215,7 @@ function buildHazardSurface(grid) {
       centerLon: (west + east) / 2,
       centerLat: (south + north) / 2,
       score: feature.properties.score,
+      displayScore: feature.properties.display_score ?? feature.properties.score,
     };
   });
 
@@ -237,7 +238,7 @@ function buildHazardSurface(grid) {
   for (const cell of cells) {
     const x = xIndex.get(cell.centerLon.toFixed(6));
     const y = yIndex.get(cell.centerLat.toFixed(6));
-    scores[y][x] = cell.score;
+    scores[y][x] = cell.displayScore;
     occupied[y][x] = true;
   }
 

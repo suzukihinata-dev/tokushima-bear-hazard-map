@@ -36,8 +36,10 @@ GRID_FEATURES = [
     "dist_river",
 ]
 MODEL_FEATURES = ["elev", "slope_p90", "agri", "dist_river", "x_km", "y_km"]
-BANDWIDTH = 0.22
+FEATURE_WEIGHTS = np.array([1.0, 1.0, 1.0, 1.0, 0.4, 0.4], dtype=float)
+BANDWIDTH = 0.4
 YEAR_WEIGHT_DECAY = 0.5
+DISPLAY_SCORE_QUANTILE = 0.99
 
 
 def _normalize_sightings(sightings: pd.DataFrame) -> pd.DataFrame:
@@ -64,7 +66,7 @@ def _feature_matrix(grid: gpd.GeoDataFrame) -> tuple[np.ndarray, np.ndarray, np.
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
     sd[sd == 0] = 1.0
-    Z = (X - mu) / sd
+    Z = ((X - mu) / sd) * FEATURE_WEIGHTS
     return Z, mu, sd
 
 
@@ -94,7 +96,7 @@ def _match_presence_samples(
         samples.append(sample)
 
     P = _transform_features(np.vstack(samples), MODEL_FEATURES)
-    P = (P - mu) / sd
+    P = ((P - mu) / sd) * FEATURE_WEIGHTS
     diagnostics = {
         "sample_count": float(len(samples)),
         "unique_meshes": float(matches["matched_meshcode"].nunique()),
@@ -153,12 +155,15 @@ def main() -> int:
     raw = (kernels * sample_weights[None, :]).sum(axis=1) / sample_weights.sum()
     score = (raw - raw.min()) / (raw.max() - raw.min() + 1e-12)
     grid["score"] = np.round(score, 4)
+    display_ceiling = max(float(np.quantile(score, DISPLAY_SCORE_QUANTILE)), 1e-6)
+    grid["display_score"] = np.round(np.clip(score / display_ceiling, 0.0, 1.0), 4)
 
     loo = _loo_check(Z, P, matched_idx, sample_weights)
     print(f"  leave-one-out 平均パーセンタイル: {loo*100:.1f}% (高いほど良い)")
+    print(f"  表示用スコア上限（{DISPLAY_SCORE_QUANTILE*100:.0f}パーセンタイル）: {display_ceiling:.4f}")
 
     # 出力（軽量化のため小数桁を抑える）
-    for col in set(GRID_FEATURES + MODEL_FEATURES):
+    for col in set(GRID_FEATURES + MODEL_FEATURES + ["display_score"]):
         if col in grid.columns:
             grid[col] = grid[col].round(2)
     C.PROCESSED.mkdir(parents=True, exist_ok=True)
