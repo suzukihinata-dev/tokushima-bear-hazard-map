@@ -1,8 +1,8 @@
 """presence-only 特徴空間類似度モデルでハザードスコアを算出する。
 
-各メッシュの特徴ベクトルを標準化し、出没メッシュ集合との
-マハラノビス距離に基づく Gaussian カーネルの平均をスコアとする。
-「既知の出没地点と地理的に似た場所」ほど高得点になる。
+各メッシュの特徴ベクトルを標準化し、交差検証で選んだ縮約特徴量に対して
+対角 Gaussian カーネルの重み付き平均をスコアとする。
+「既知の出没地点と地理的・空間的に似た場所」ほど高得点になる。
 
 入力 : data/processed/grid_features.geojson, data/sightings.csv
 出力 : data/processed/grid_scores.geojson, data/processed/sightings.geojson
@@ -24,7 +24,7 @@ from sightings_utils import (
 )
 import weather_features
 
-FEATURES = [
+GRID_FEATURES = [
     "elev",
     "slope",
     "slope_p90",
@@ -35,7 +35,11 @@ FEATURES = [
     "agri",
     "dist_river",
 ]
-BANDWIDTH = 1.0  # Gaussian カーネルのバンド幅
+MODEL_FEATURES = ["elev", "slope_p90", "agri", "dist_river", "x_km", "y_km"]
+FEATURE_WEIGHTS = np.array([1.0, 1.0, 1.0, 1.0, 0.4, 0.4], dtype=float)
+BANDWIDTH = 0.4
+YEAR_WEIGHT_DECAY = 0.5
+DISPLAY_SCORE_QUANTILE = 0.99
 
 
 def _normalize_sightings(sightings: pd.DataFrame) -> pd.DataFrame:
@@ -50,35 +54,26 @@ def _normalize_sightings(sightings: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _transform_features(X: np.ndarray) -> np.ndarray:
+def _transform_features(X: np.ndarray, features: list[str]) -> np.ndarray:
     out = X.astype(float).copy()
-    out[:, FEATURES.index("dist_river")] = np.log1p(out[:, FEATURES.index("dist_river")])
+    if "dist_river" in features:
+        out[:, features.index("dist_river")] = np.log1p(out[:, features.index("dist_river")])
     return out
 
 
 def _feature_matrix(grid: gpd.GeoDataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    X = _transform_features(grid[FEATURES].to_numpy(dtype=float))
+    X = _transform_features(grid[MODEL_FEATURES].to_numpy(dtype=float), MODEL_FEATURES)
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
     sd[sd == 0] = 1.0
-    Z = (X - mu) / sd
+    Z = ((X - mu) / sd) * FEATURE_WEIGHTS
     return Z, mu, sd
 
 
-def _cov_inv(Z: np.ndarray) -> np.ndarray:
-    cov = np.cov(Z, rowvar=False)
-    cov += np.eye(cov.shape[0]) * 1e-3  # 正則化（特異行列回避）
-    return np.linalg.inv(cov)
-
-
-def _similarity(Z: np.ndarray, P: np.ndarray, cov_inv: np.ndarray, h: float) -> np.ndarray:
-    """各行 Z について presence 集合 P との Gaussian カーネル平均を返す。"""
-    scores = np.zeros(len(Z))
-    for p in P:
-        d = Z - p
-        m2 = np.einsum("ij,jk,ik->i", d, cov_inv, d)  # マハラノビス距離^2
-        scores += np.exp(-0.5 * m2 / (h * h))
-    return scores / len(P)
+def _kernel_matrix(Z: np.ndarray, P: np.ndarray, h: float) -> np.ndarray:
+    """標準化済み特徴量の対角 Gaussian カーネル行列を返す。"""
+    d2 = ((Z[:, None, :] - P[None, :, :]) ** 2).sum(axis=2)
+    return np.exp(-0.5 * d2 / (h * h))
 
 
 def _match_presence_samples(
@@ -87,7 +82,7 @@ def _match_presence_samples(
     mu: np.ndarray,
     sd: np.ndarray,
 ) -> tuple[np.ndarray, pd.DataFrame, dict[str, float]]:
-    grid_raw = grid[FEATURES].to_numpy(dtype=float)
+    grid_raw = grid[MODEL_FEATURES].to_numpy(dtype=float)
     matches = match_sightings_to_grid(grid, sightings, C.MESH_LEVEL)
 
     samples: list[np.ndarray] = []
@@ -97,11 +92,11 @@ def _match_presence_samples(
         best_idx = int(match["matched_idx"])
         sample = grid_raw[best_idx].copy()
         if pd.notna(observed_elev):
-            sample[FEATURES.index("elev")] = float(observed_elev)
+            sample[MODEL_FEATURES.index("elev")] = float(observed_elev)
         samples.append(sample)
 
-    P = _transform_features(np.vstack(samples))
-    P = (P - mu) / sd
+    P = _transform_features(np.vstack(samples), MODEL_FEATURES)
+    P = ((P - mu) / sd) * FEATURE_WEIGHTS
     diagnostics = {
         "sample_count": float(len(samples)),
         "unique_meshes": float(matches["matched_meshcode"].nunique()),
@@ -114,14 +109,22 @@ def _match_presence_samples(
     return P, matches, diagnostics
 
 
-def _loo_check(Z: np.ndarray, P: np.ndarray, matched_idx: np.ndarray, cov_inv: np.ndarray) -> float:
+def _year_sample_weights(sightings: pd.DataFrame) -> np.ndarray:
+    years = pd.to_datetime(sightings["date"], errors="coerce").dt.year
+    max_year = int(years.max())
+    return np.power(YEAR_WEIGHT_DECAY, max_year - years.to_numpy(dtype=int))
+
+
+def _loo_check(Z: np.ndarray, P: np.ndarray, matched_idx: np.ndarray, sample_weights: np.ndarray) -> float:
     """leave-one-out: 各出没メッシュが全体で上位何%に入るかの平均。"""
     if len(P) <= 1:
         return float("nan")
+    kernels = _kernel_matrix(Z, P, BANDWIDTH)
     pcts = []
     for k in range(len(P)):
-        others = np.delete(P, k, axis=0)
-        s = _similarity(Z, others, cov_inv, BANDWIDTH)
+        mask = np.ones(len(P), dtype=bool)
+        mask[k] = False
+        s = (kernels[:, mask] * sample_weights[mask]).sum(axis=1) / sample_weights[mask].sum()
         rank = (s < s[matched_idx[k]]).mean()  # 自分より低いスコアの割合
         pcts.append(rank)
     return float(np.mean(pcts)) if pcts else float("nan")
@@ -136,9 +139,9 @@ def main() -> int:
     sightings["point_dist_river"] = point_river_distances(sightings)
 
     Z, mu, sd = _feature_matrix(grid)
-    cov_inv = _cov_inv(Z)
     P, matches, diag = _match_presence_samples(grid, sightings, mu, sd)
     matched_idx = matches["matched_idx"].to_numpy(dtype=int)
+    sample_weights = _year_sample_weights(sightings)
     print(
         "  出没サンプル:"
         f" {int(diag['sample_count'])}件 / {int(diag['unique_meshes'])}メッシュ"
@@ -148,16 +151,21 @@ def main() -> int:
     if not np.isnan(diag["mean_elev_gap_m"]):
         print(f"  割当メッシュ平均との差標高: {diag['mean_elev_gap_m']:.1f} m")
 
-    raw = _similarity(Z, P, cov_inv, BANDWIDTH)
+    kernels = _kernel_matrix(Z, P, BANDWIDTH)
+    raw = (kernels * sample_weights[None, :]).sum(axis=1) / sample_weights.sum()
     score = (raw - raw.min()) / (raw.max() - raw.min() + 1e-12)
     grid["score"] = np.round(score, 4)
+    display_ceiling = max(float(np.quantile(score, DISPLAY_SCORE_QUANTILE)), 1e-6)
+    grid["display_score"] = np.round(np.clip(score / display_ceiling, 0.0, 1.0), 4)
 
-    loo = _loo_check(Z, P, matched_idx, cov_inv)
+    loo = _loo_check(Z, P, matched_idx, sample_weights)
     print(f"  leave-one-out 平均パーセンタイル: {loo*100:.1f}% (高いほど良い)")
+    print(f"  表示用スコア上限（{DISPLAY_SCORE_QUANTILE*100:.0f}パーセンタイル）: {display_ceiling:.4f}")
 
     # 出力（軽量化のため小数桁を抑える）
-    for col in FEATURES:
-        grid[col] = grid[col].round(2)
+    for col in set(GRID_FEATURES + MODEL_FEATURES + ["display_score"]):
+        if col in grid.columns:
+            grid[col] = grid[col].round(2)
     C.PROCESSED.mkdir(parents=True, exist_ok=True)
     grid.to_file(C.PROCESSED / "grid_scores.geojson", driver="GeoJSON")
 
