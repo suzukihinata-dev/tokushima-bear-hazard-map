@@ -24,6 +24,7 @@
 | building | 建物用地率 | 同上 |
 | agri | 農地率 | 同上 |
 | dist_river | 最近隣河川までの距離 | 国土数値情報 河川データ W05 |
+| x_km / y_km | メッシュ中心の投影座標（km） | メッシュ形状から算出 |
 
 出没地点には日付から `year` / `month` / `season` / `activity_period` /
 `is_food_season` / `is_denning_season` / `moon_phase` を付与します。
@@ -82,16 +83,21 @@ python -m http.server 8000 --directory docs
 ```
 
 ## 手法（スコアリング）
-1. 各メッシュの特徴ベクトル
-   `x = [elev, slope, slope_p90, steep_ratio, relief, forest, building, agri, log(dist_river)]`
+1. 各メッシュから、交差検証で効いた縮約特徴量
+   `x = [elev, slope_p90, agri, log(dist_river), x_km, y_km]`
+   を使用する
 2. 全メッシュ統計で z-score 標準化
-3. 全メッシュから正則化付き共分散 Σ を推定
-4. 各出没点を近傍メッシュへ仮対応させ、観測標高がある場合は標高差と距離の両方で
+3. 各出没点を近傍メッシュへ仮対応させ、観測標高がある場合は標高差と距離の両方で
    最も整合するメッシュへ補正する
-5. 各メッシュのスコア `= mean_i exp( −0.5 · d_M(x, pᵢ)² / h² )`
-   （pᵢ: 出没サンプル、d_M: マハラノビス距離、h: バンド幅）
+4. 各メッシュのスコア `= weighted_mean_i exp( −0.5 · ||x - pᵢ||² / h² )`
+   （pᵢ: 出没サンプル、h: バンド幅）
+5. サンプル重みは `YEAR_WEIGHT_DECAY=0.5` による年次減衰をかけ、最近年の出没をやや重視する
 6. 0–1 に正規化して GeoJSON へ
 - 妥当性確認: leave-one-out による出没メッシュの平均パーセンタイル（実行時にログ出力）
+
+注:
+現在の高精度化は、地形・土地利用に加えて `x_km / y_km` の広域位置コンテキストも使っています。
+したがって、純粋な「生息地条件だけの類似度」ではなく、徳島県内での空間分布傾向も反映したスコアです。
 
 ## 天気・季節データの追加
 `data/weather_daily.csv` は以下の列に対応しています。`date` は必須で、それ以外は任意です。

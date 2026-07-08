@@ -3,7 +3,7 @@
 特徴量: 標高(elev) / 平均傾斜(slope) / 上位傾斜(slope_p90) /
         急斜面率(steep_ratio) / 起伏(relief) /
         森林率(forest) / 建物用地率(building) / 農地率(agri) /
-        最近隣河川距離(dist_river)
+        最近隣河川距離(dist_river) / メッシュ中心座標(x_km, y_km)
 出力: data/processed/grid_features.geojson
 """
 from __future__ import annotations
@@ -158,6 +158,20 @@ def _river_distance(grid: gpd.GeoDataFrame) -> pd.DataFrame:
     return out
 
 
+def _spatial_context(grid: gpd.GeoDataFrame) -> pd.DataFrame:
+    grid_m = grid.to_crs(C.CRS_METRIC)
+    cent = grid_m.geometry.centroid
+    out = pd.DataFrame(
+        {
+            "meshcode": grid["meshcode"].to_numpy(),
+            "x_km": cent.x.to_numpy(dtype=float) / 1000.0,
+            "y_km": cent.y.to_numpy(dtype=float) / 1000.0,
+        }
+    )
+    print(f"  空間文脈: {len(out)} メッシュ")
+    return out
+
+
 def main() -> int:
     print("[build_features]")
     boundary = _load_boundary()
@@ -168,13 +182,18 @@ def main() -> int:
     boundary.to_file(C.DOCS_DATA / "pref_boundary.geojson", driver="GeoJSON")
     print(f"  県境ポリゴン: {boundary_out}")
     grid = _build_grid(boundary)
-    for feat in (_terrain_features(grid), _landuse_features(grid), _river_distance(grid)):
+    for feat in (
+        _terrain_features(grid),
+        _landuse_features(grid),
+        _river_distance(grid),
+        _spatial_context(grid),
+    ):
         if not feat.empty:
             grid = grid.merge(feat, on="meshcode", how="left")
     # 欠損補完
     for col, fill in [
         ("elev", 0.0), ("slope", 0.0), ("slope_p90", 0.0), ("steep_ratio", 0.0), ("relief", 0.0),
-        ("forest", 0.0), ("building", 0.0), ("agri", 0.0),
+        ("forest", 0.0), ("building", 0.0), ("agri", 0.0), ("x_km", 0.0), ("y_km", 0.0),
     ]:
         if col in grid:
             grid[col] = grid[col].fillna(fill)
