@@ -1,3 +1,5 @@
+# ひなた〜
+
 """共通設定（パス・対象範囲・データソースURL）。"""
 from __future__ import annotations
 
